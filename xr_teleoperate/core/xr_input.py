@@ -9,6 +9,7 @@ anything but the head. Head yaw is relative to that direction; pitch is absolute
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -64,6 +65,66 @@ def _wrap(angle: float) -> float:
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
+class _ScaledEgoSession:
+    """Session proxy that scales the height of every `ImageBackground` upserted through it.
+
+    televuer draws the ego image as `ImageBackground(height=0.75, distanceToCamera=2)`; the plane stays at 2 m
+    and only its height (the width follows from `aspect`) is multiplied, so it is `scale` times larger in the
+    field of view without a closer focus distance.
+    """
+
+    def __init__(self, session, scale: float):
+        self._session = session
+        self._scale = scale
+
+    def upsert(self, elements, *args, **kwargs):
+        for element in elements if isinstance(elements, (list, tuple)) else [elements]:
+            if type(element).__name__ == "ImageBackground" and not getattr(element, "_ego_scaled", False):
+                element.height = element.height * self._scale
+                element._ego_scaled = True
+        return self._session.upsert(elements, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+
+def make_scaled_ego_televuer(base, ego_scale: float):
+    """`base` (televuer's TeleVuer) with its zmq ego image windows `ego_scale` times larger.
+
+    TeleVuer picks and spawns its display coroutine in `__init__`, so the override has to exist as a class; the
+    upstream code is reused unchanged, only the session it draws on is wrapped.
+    """
+
+    class ScaledEgoTeleVuer(base):
+        async def main_image_binocular_zmq_ego(self, session):
+            await super().main_image_binocular_zmq_ego(_ScaledEgoSession(session, ego_scale))
+
+        async def main_image_monocular_zmq_ego(self, session):
+            await super().main_image_monocular_zmq_ego(_ScaledEgoSession(session, ego_scale))
+
+    return ScaledEgoTeleVuer
+
+
+@contextmanager
+def _scaled_ego(ego_scale: float):
+    """Make `TeleVuerWrapper` build the scaled TeleVuer subclass while constructing (no-op for scale 1).
+
+    The wrapper hardcodes `TeleVuer` as a module global of `televuer.tv_wrapper` and offers no hook, so that name
+    is swapped for the duration of the constructor only and restored afterwards.
+    """
+    if ego_scale == 1.0:
+        yield
+        return
+    from televuer import tv_wrapper
+
+    original = tv_wrapper.TeleVuer
+    tv_wrapper.TeleVuer = make_scaled_ego_televuer(original, ego_scale)
+    try:
+        yield
+    finally:
+        tv_wrapper.TeleVuer = original
+
+
 class XRInput:
     """televuer (Vuer WebXR on https://<host>:8012) read as `XRFrame`s; the Vuer server runs in its own process."""
 
@@ -76,25 +137,31 @@ class XRInput:
         display_fps: float = 30.0,
         cert_file: str | None = None,
         key_file: str | None = None,
+        ego_scale: float = 1.0,
     ):
+        """`ego_scale`: size of the `ego` image window relative to televuer's stock 0.75 m tall plane at 2 m."""
         if input_mode not in ("controller", "hand"):
             raise ValueError(f"Unknown input_mode {input_mode!r}; expected 'controller' or 'hand'")
+        if not ego_scale > 0:
+            raise ValueError(f"ego_scale must be > 0, got {ego_scale}")
         from televuer import TeleVuerWrapper
 
         self.use_hands = input_mode == "hand"
         self.display_mode = display_mode
         self.image_shape = tuple(image_shape)
-        self.wrapper = TeleVuerWrapper(
-            use_hand_tracking=self.use_hands,
-            binocular=binocular,
-            img_shape=image_shape,
-            display_fps=display_fps,
-            display_mode=display_mode,
-            zmq=display_mode != "pass-through",
-            cert_file=cert_file,
-            key_file=key_file,
-            arm_reference_mode="head_position",
-        )
+        self.ego_scale = float(ego_scale)
+        with _scaled_ego(self.ego_scale if display_mode == "ego" else 1.0):
+            self.wrapper = TeleVuerWrapper(
+                use_hand_tracking=self.use_hands,
+                binocular=binocular,
+                img_shape=image_shape,
+                display_fps=display_fps,
+                display_mode=display_mode,
+                zmq=display_mode != "pass-through",
+                cert_file=cert_file,
+                key_file=key_file,
+                arm_reference_mode="head_position",
+            )
         self.yaw0 = 0.0
 
     def recenter(self) -> None:

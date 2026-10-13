@@ -99,3 +99,92 @@ def test_close_releases_the_display_shared_memory():
     with pytest.raises(FileNotFoundError):
         shared_memory.SharedMemory(name=shm.name)
     make_xr(shm=None).close()
+
+
+# --- ego_scale -----------------------------------------------------------------------------------------
+
+
+def _fake_televuer(monkeypatch):
+    """A fake `televuer` package: TeleVuer records the coroutine class it was built from."""
+    import sys
+    import types
+
+    class ImageBackground:
+        def __init__(self, height=0.75, distanceToCamera=2):
+            self.height = height
+            self.distanceToCamera = distanceToCamera
+
+    class TeleVuer:
+        async def main_image_monocular_zmq_ego(self, session):
+            session.upsert([ImageBackground()], to="bgChildren")
+
+        async def main_image_binocular_zmq_ego(self, session):
+            session.upsert([ImageBackground(), ImageBackground()], to="bgChildren")
+
+    built = []
+
+    class TeleVuerWrapper:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.tvuer = tv_wrapper.TeleVuer()
+            built.append(self.tvuer)
+
+    tv_wrapper = types.ModuleType("televuer.tv_wrapper")
+    tv_wrapper.TeleVuer = TeleVuer
+    pkg = types.ModuleType("televuer")
+    pkg.TeleVuerWrapper = TeleVuerWrapper
+    pkg.tv_wrapper = tv_wrapper
+    monkeypatch.setitem(sys.modules, "televuer", pkg)
+    monkeypatch.setitem(sys.modules, "televuer.tv_wrapper", tv_wrapper)
+    return tv_wrapper, TeleVuer, built
+
+
+class RecordingSession:
+    def __init__(self):
+        self.upserts = []
+
+    def upsert(self, elements, **kwargs):
+        self.upserts.append((elements, kwargs))
+
+
+def _run(coro):
+    import asyncio
+
+    asyncio.run(coro)
+
+
+@pytest.mark.parametrize("scale", [0, -1.0, float("nan")])
+def test_ego_scale_must_be_positive(scale, monkeypatch):
+    _fake_televuer(monkeypatch)
+    with pytest.raises(ValueError, match="ego_scale"):
+        XRInput(display_mode="ego", ego_scale=scale)
+
+
+def test_default_ego_scale_leaves_upstream_televuer_untouched(monkeypatch):
+    _, TeleVuer, built = _fake_televuer(monkeypatch)
+    XRInput(display_mode="ego")
+    assert type(built[0]) is TeleVuer
+    session = RecordingSession()
+    _run(built[0].main_image_monocular_zmq_ego(session))
+    assert session.upserts[0][0][0].height == 0.75
+
+
+@pytest.mark.parametrize("binocular", [False, True])
+def test_ego_scale_enlarges_the_ego_window_keeping_distance(binocular, monkeypatch):
+    tv_wrapper, TeleVuer, built = _fake_televuer(monkeypatch)
+    xr = XRInput(display_mode="ego", binocular=binocular, ego_scale=2.0)
+    assert xr.ego_scale == 2.0 and isinstance(built[0], TeleVuer) and type(built[0]) is not TeleVuer
+    session = RecordingSession()
+    coro = built[0].main_image_binocular_zmq_ego if binocular else built[0].main_image_monocular_zmq_ego
+    _run(coro(session))
+    elements, kwargs = session.upserts[0]
+    assert kwargs == {"to": "bgChildren"}
+    assert [e.height for e in elements] == [1.5] * len(elements)
+    assert all(e.distanceToCamera == 2 for e in elements)
+    assert tv_wrapper.TeleVuer is TeleVuer  # the patch is scoped to construction
+
+
+def test_ego_scale_ignored_outside_ego_mode(monkeypatch):
+    _, TeleVuer, built = _fake_televuer(monkeypatch)
+    XRInput(display_mode="immersive", ego_scale=3.0)
+    assert type(built[0]) is TeleVuer
