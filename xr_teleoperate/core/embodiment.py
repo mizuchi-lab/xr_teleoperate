@@ -22,7 +22,7 @@ HEAD_SENSORS: tuple[str, ...] = ("d435i", "d455")
 SIDES: tuple[str, ...] = ("left", "right")
 
 ROBOT_TYPE_PREFIX = "unitree_g1"
-SIM_REPO_ID = "k-valentin/unitree-g1-mujoco"
+SIM_REPO_ID = "mizuchi-lab/unitree-g1-mujoco"
 # A local sim checkout (or snapshot) to compose from instead of the Hub.
 SIM_ROOT_ENV = "XR_TELEOP_SIM_ROOT"
 
